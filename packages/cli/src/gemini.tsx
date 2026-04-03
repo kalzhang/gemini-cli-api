@@ -3,7 +3,6 @@
  * Copyright 2025 Google LLC
  * SPDX-License-Identifier: Apache-2.0
  */
-
 import {
   type StartupWarning,
   WarningPriority,
@@ -34,7 +33,7 @@ import {
   debugLogger,
   isHeadlessMode,
 } from '@google/gemini-cli-core';
-
+import { writeSync } from 'fs';
 import { loadCliConfig, parseArguments } from './config/config.js';
 import * as cliConfig from './config/config.js';
 import { readStdin } from './utils/readStdin.js';
@@ -57,6 +56,7 @@ import { getStartupWarnings } from './utils/startupWarnings.js';
 import { getUserStartupWarnings } from './utils/userStartupWarnings.js';
 import { ConsolePatcher } from './ui/utils/ConsolePatcher.js';
 import { runNonInteractive } from './nonInteractiveCli.js';
+import { runServeCommand } from './serveCommand.js';
 import {
   cleanupCheckpoints,
   registerCleanup,
@@ -79,7 +79,6 @@ import { runAcpClient } from './acp/acpClient.js';
 import { validateNonInteractiveAuth } from './validateNonInterActiveAuth.js';
 import { appEvents, AppEvent } from './utils/events.js';
 import { SessionError, SessionSelector } from './utils/sessionUtils.js';
-
 import {
   relaunchAppInChildProcess,
   relaunchOnExitCode,
@@ -88,7 +87,6 @@ import { loadSandboxConfig } from './config/sandboxConfig.js';
 import { deleteSession, listSessions } from './utils/sessions.js';
 import { createPolicyUpdater } from './config/policy.js';
 import { isAlternateBufferEnabled } from './ui/hooks/useAlternateBuffer.js';
-
 import { setupTerminalAndTheme } from './utils/terminalTheme.js';
 import { runDeferredCommand } from './deferred.js';
 import { cleanupBackgroundLogs } from './utils/logCleanup.js';
@@ -104,7 +102,6 @@ export function validateDnsResolutionOrder(
   if (order === 'ipv4first' || order === 'verbatim') {
     return order;
   }
-  // We don't want to throw here, just warn and use the default.
   debugLogger.warn(
     `Invalid value for dnsResolutionOrder in settings: "${order}". Using default "${defaultValue}".`,
   );
@@ -117,19 +114,15 @@ export function getNodeMemoryArgs(isDebugMode: boolean): string[] {
   const currentMaxOldSpaceSizeMb = Math.floor(
     heapStats.heap_size_limit / 1024 / 1024,
   );
-
-  // Set target to 50% of total memory
   const targetMaxOldSpaceSizeInMB = Math.floor(totalMemoryMB * 0.5);
   if (isDebugMode) {
     debugLogger.debug(
       `Current heap size ${currentMaxOldSpaceSizeMb.toFixed(2)} MB`,
     );
   }
-
   if (process.env['GEMINI_CLI_NO_RELAUNCH']) {
     return [];
   }
-
   if (targetMaxOldSpaceSizeInMB > currentMaxOldSpaceSizeMb) {
     if (isDebugMode) {
       debugLogger.debug(
@@ -138,7 +131,6 @@ export function getNodeMemoryArgs(isDebugMode: boolean): string[] {
     }
     return [`--max-old-space-size=${targetMaxOldSpaceSizeInMB}`];
   }
-
   return [];
 }
 
@@ -172,7 +164,6 @@ export async function startInteractiveUI(
   resumedSessionData: ResumedSessionData | undefined,
   initializationResult: InitializationResult,
 ) {
-  // Dynamically import the heavy UI module so React/Ink are only parsed when needed
   const { startInteractiveUI: doStartUI } = await import('./interactiveCli.js');
   await doStartUI(
     config,
@@ -187,22 +178,16 @@ export async function startInteractiveUI(
 export async function main() {
   const cliStartupHandle = startupProfiler.start('cli_startup');
 
-  // Listen for admin controls from parent process (IPC) in non-sandbox mode. In
-  // sandbox mode, we re-fetch the admin controls from the server once we enter
-  // the sandbox.
-  // TODO: Cache settings in sandbox mode as well.
   const adminControlsListner = setupAdminControlsListener();
   registerCleanup(adminControlsListner.cleanup);
 
   const cleanupStdio = patchStdio();
   registerSyncCleanup(() => {
-    // This is needed to ensure we don't lose any buffered output.
     initializeOutputListenersAndFlush();
     cleanupStdio();
   });
 
   setupUnhandledRejectionHandler();
-
   setupSignalHandlers();
 
   const slashCommandConflictHandler = new SlashCommandConflictHandler();
@@ -213,9 +198,6 @@ export async function main() {
   const settings = loadSettings();
   loadSettingsHandle?.end();
 
-  // If a worktree is requested and enabled, set it up early.
-  // This must be awaited before any other async tasks that depend on CWD (like loadCliConfig)
-  // because setupWorktree calls process.chdir().
   const requestedWorktree = cliConfig.getRequestedWorktreeName(settings);
   let worktreeInfo: WorktreeInfo | undefined;
   if (requestedWorktree !== undefined) {
@@ -244,7 +226,6 @@ export async function main() {
 
   const rawStartupWarningsPromise = getStartupWarnings();
 
-  // Report settings errors once during startup
   settings.errors.forEach((error) => {
     coreEvents.emitFeedback('warning', error.message);
   });
@@ -258,6 +239,7 @@ export async function main() {
   });
 
   const argv = await argvPromise;
+
 
   if (
     (argv.allowedTools && argv.allowedTools.length > 0) ||
@@ -285,7 +267,6 @@ export async function main() {
     });
   }
 
-  // Check for invalid input combinations early to prevent crashes
   if (argv.promptInteractive && !process.stdin.isTTY) {
     writeToStderr(
       'Error: The --prompt-interactive flag cannot be used when input is piped from stdin.\n',
@@ -310,7 +291,6 @@ export async function main() {
     validateDnsResolutionOrder(settings.merged.advanced.dnsResolutionOrder),
   );
 
-  // Set a default auth type if one isn't set or is set to a legacy type
   if (
     !settings.merged.security.auth.selectedType ||
     settings.merged.security.auth.selectedType === AuthType.LEGACY_CLOUD_SHELL
@@ -332,9 +312,6 @@ export async function main() {
   });
   adminControlsListner.setConfig(partialConfig);
 
-  // Refresh auth to fetch remote admin settings from CCPA and before entering
-  // the sandbox because the sandbox will interfere with the Oauth2 web
-  // redirect.
   let initialAuthFailed = false;
   if (!settings.merged.security.auth.useExternal && !argv.isCommand) {
     try {
@@ -348,7 +325,6 @@ export async function main() {
         if (err) {
           throw new Error(err);
         }
-
         await partialConfig.refreshAuth(
           settings.merged.security.auth.selectedType,
         );
@@ -363,14 +339,9 @@ export async function main() {
       }
     } catch (err) {
       if (err instanceof ValidationCancelledError) {
-        // User cancelled verification, exit immediately.
         await runExitCleanup();
         process.exit(ExitCodes.SUCCESS);
       }
-
-      // If validation is required, we don't treat it as a fatal failure.
-      // We allow the app to start, and the React-based ValidationDialog
-      // will handle it.
       if (!(err instanceof ValidationRequiredError)) {
         debugLogger.error('Error authenticating:', err);
         initialAuthFailed = true;
@@ -379,25 +350,18 @@ export async function main() {
   }
 
   const remoteAdminSettings = partialConfig.getRemoteAdminSettings();
-  // Set remote admin settings if returned from CCPA.
   if (remoteAdminSettings) {
     settings.setRemoteAdminSettings(remoteAdminSettings);
   }
 
-  // Run deferred command now that we have admin settings.
   await runDeferredCommand(settings.merged);
 
-  // hop into sandbox if we are outside and sandboxing is enabled
-  if (!process.env['SANDBOX'] && !argv.isCommand) {
+
+  if (!process.env['SANDBOX'] && !argv.isCommand && argv._?.[0] !== 'serve') {
     const memoryArgs = settings.merged.advanced.autoConfigureMemory
       ? getNodeMemoryArgs(isDebugMode)
       : [];
     const sandboxConfig = await loadSandboxConfig(settings.merged, argv);
-    // We intentionally omit the list of extensions here because extensions
-    // should not impact auth or setting up the sandbox.
-    // TODO(jacobr): refactor loadCliConfig so there is a minimal version
-    // that only initializes enough config to enable refreshAuth or find
-    // another way to decouple refreshAuth from requiring a config.
 
     if (sandboxConfig) {
       if (initialAuthFailed) {
@@ -409,8 +373,6 @@ export async function main() {
         stdinData = await readStdin();
       }
 
-      // This function is a copy of the one from sandbox.ts
-      // It is moved here to decouple sandbox.ts from the CLI's argument structure.
       const injectStdinIntoArgs = (
         args: string[],
         stdinData?: string,
@@ -421,11 +383,9 @@ export async function main() {
             (arg) => arg === '--prompt' || arg === '-p',
           );
           if (promptIndex > -1 && finalArgs.length > promptIndex + 1) {
-            // If there's a prompt argument, prepend stdin to it
             finalArgs[promptIndex + 1] =
               `${stdinData}\n\n${finalArgs[promptIndex + 1]}`;
           } else {
-            // If there's no prompt argument, add stdin as the prompt
             finalArgs.push('--prompt', stdinData);
           }
         }
@@ -433,7 +393,6 @@ export async function main() {
       };
 
       const sandboxArgs = injectStdinIntoArgs(process.argv, stdinData);
-
       await relaunchOnExitCode(() =>
         start_sandbox(sandboxConfig, memoryArgs, partialConfig, sandboxArgs),
       );
@@ -446,10 +405,8 @@ export async function main() {
     }
   }
 
-  // We are now past the logic handling potentially launching a child process
-  // to run Gemini CLI. It is now safe to perform expensive initialization that
-  // may have side effects.
   {
+
     const loadConfigHandle = startupProfiler.start('load_cli_config');
     const config = await loadCliConfig(settings.merged, sessionId, argv, {
       projectHooks: settings.workspace.settings.hooks,
@@ -457,9 +414,6 @@ export async function main() {
     });
     loadConfigHandle?.end();
 
-    // Initialize storage immediately after loading config to ensure that
-    // storage-related operations (like listing or resuming sessions) have
-    // access to the project identifier.
     await config.storage.initialize();
 
     adminControlsListner.setConfig(config);
@@ -471,21 +425,16 @@ export async function main() {
       await setupInitialActivityLogger(config);
     }
 
-    // Register config for telemetry shutdown
-    // This ensures telemetry (including SessionEnd hooks) is properly flushed on exit
     registerTelemetryConfig(config);
 
     const policyEngine = config.getPolicyEngine();
     const messageBus = config.getMessageBus();
     createPolicyUpdater(policyEngine, messageBus, config.storage);
 
-    // Register SessionEnd hook to fire on graceful exit
-    // This runs before telemetry shutdown in runExitCleanup()
     registerCleanup(async () => {
       await config.getHookSystem()?.fireSessionEndEvent(SessionEndReason.Exit);
     });
 
-    // Launch cleanup expired sessions as a background task
     cleanupExpiredSessions(config, settings.merged).catch((e) => {
       debugLogger.error('Failed to cleanup expired sessions:', e);
     });
@@ -499,28 +448,23 @@ export async function main() {
       process.exit(ExitCodes.SUCCESS);
     }
 
-    // Handle --list-sessions flag
     if (config.getListSessions()) {
-      // Attempt auth for summary generation (gracefully skips if not configured)
       const authType = settings.merged.security.auth.selectedType;
       if (authType) {
         try {
           await config.refreshAuth(authType);
         } catch (e) {
-          // Auth failed - continue without summary generation capability
           debugLogger.debug(
             'Auth failed for --list-sessions, summaries may not be generated:',
             e,
           );
         }
       }
-
       await listSessions(config);
       await runExitCleanup();
       process.exit(ExitCodes.SUCCESS);
     }
 
-    // Handle --delete-session flag
     const sessionToDelete = config.getDeleteSession();
     if (sessionToDelete) {
       await deleteSession(config, sessionToDelete);
@@ -528,13 +472,24 @@ export async function main() {
       process.exit(ExitCodes.SUCCESS);
     }
 
+    if (argv._?.[0] === 'serve') {
+      try {
+        const selectedType = settings.merged.security.auth.selectedType;
+        if (selectedType) {
+          await config.refreshAuth(selectedType);
+        }
+        initializeOutputListenersAndFlush(); // ← add this
+        await runServeCommand(config, argv.port);
+      } catch (err) {
+        writeSync(2, `Serve mode error: ${err}\n`);  // use writeSync here too
+      }
+      await runExitCleanup();
+      return;
+    }
+
     const wasRaw = process.stdin.isRaw;
     if (config.isInteractive() && !wasRaw && process.stdin.isTTY) {
-      // Set this as early as possible to avoid spurious characters from
-      // input showing up in the output.
       process.stdin.setRawMode(true);
-
-      // This cleanup isn't strictly needed but may help in certain situations.
       registerSyncCleanup(() => {
         process.stdin.setRawMode(wasRaw);
       });
@@ -553,7 +508,6 @@ export async function main() {
         AuthType.LOGIN_WITH_GOOGLE &&
       config.isBrowserLaunchSuppressed()
     ) {
-      // Do oauth before app renders to make copying the link possible.
       await getOauthClient(settings.merged.security.auth.selectedType, config);
     }
 
@@ -578,7 +532,6 @@ export async function main() {
       })),
     ];
 
-    // Handle --resume flag
     let resumedSessionData: ResumedSessionData | undefined = undefined;
     if (argv.resume) {
       const sessionSelector = new SessionSelector(config);
@@ -588,14 +541,12 @@ export async function main() {
           conversation: result.sessionData,
           filePath: result.sessionPath,
         };
-        // Use the existing session ID to continue recording to the same session
         config.setSessionId(resumedSessionData.conversation.sessionId);
       } catch (error) {
         if (
           error instanceof SessionError &&
           error.code === 'NO_SESSIONS_FOUND'
         ) {
-          // No sessions to resume — start a fresh session with a warning
           startupWarnings.push({
             id: 'resume-no-sessions',
             message: error.message,
@@ -614,16 +565,10 @@ export async function main() {
 
     cliStartupHandle?.end();
 
-    // Render UI, passing necessary config values. Check that there is no command line question.
     if (config.isInteractive()) {
-      // Earlier initialization phases (like TerminalCapabilityManager resolving
-      // or authWithWeb) may have added and removed 'data' listeners on process.stdin.
-      // When the listener count drops to 0, Node.js implicitly pauses the stream buffer.
-      // React Ink's useInput hooks will silently fail to receive keystrokes if the stream remains paused.
       if (process.stdin.isTTY) {
         process.stdin.resume();
       }
-
       await startInteractiveUI(
         config,
         settings,
@@ -638,8 +583,6 @@ export async function main() {
     await config.initialize();
     startupProfiler.flush(config);
 
-    // If not a TTY, read from stdin
-    // This is for cases where the user pipes input directly into the command
     let stdinData: string | undefined = undefined;
     if (!process.stdin.isTTY) {
       stdinData = await readStdin();
@@ -648,8 +591,6 @@ export async function main() {
       }
     }
 
-    // Fire SessionStart hook through MessageBus (only if hooks are enabled)
-    // Must be called AFTER config.initialize() to ensure HookRegistry is loaded
     const sessionStartSource = resumedSessionData
       ? SessionStartSource.Resume
       : SessionStartSource.Startup;
@@ -657,14 +598,12 @@ export async function main() {
     const hookSystem = config?.getHookSystem();
     if (hookSystem) {
       const result = await hookSystem.fireSessionStartEvent(sessionStartSource);
-
       if (result) {
         if (result.systemMessage) {
           writeToStderr(result.systemMessage + '\n');
         }
         const additionalContext = result.getAdditionalContext();
         if (additionalContext) {
-          // Prepend context to input (System Context -> Stdin -> Question)
           const wrappedContext = `<hook_context>${additionalContext}</hook_context>`;
           input = input ? `${wrappedContext}\n\n${input}` : wrappedContext;
         }
@@ -711,17 +650,13 @@ export async function main() {
       prompt_id,
       resumedSessionData,
     });
-    // Call cleanup before process.exit, which causes cleanup to not run
     await runExitCleanup();
     process.exit(ExitCodes.SUCCESS);
   }
 }
 
 export function initializeOutputListenersAndFlush() {
-  // If there are no listeners for output, make sure we flush so output is not
-  // lost.
   if (coreEvents.listenerCount(CoreEvent.Output) === 0) {
-    // In non-interactive mode, ensure we drain any buffered output or logs to stderr
     coreEvents.on(CoreEvent.Output, (payload: OutputPayload) => {
       if (payload.isStderr) {
         writeToStderr(payload.chunk, payload.encoding);

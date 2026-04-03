@@ -6,6 +6,11 @@
     "topicUpdateNarration": true
   },
   "general": {
-    "devtools": true
+    "previewFeatures": true,
+    "devtools": true,
+    "enableAutoUpdate": false
+  },
+  "privacy": {
+    "usageStatisticsEnabled": false
   }
 }

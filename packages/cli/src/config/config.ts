@@ -81,6 +81,7 @@ export interface CliArgs {
   prompt: string | undefined;
   promptInteractive: string | undefined;
   worktree?: string;
+  _?: string[];
 
   yolo: boolean | undefined;
   approvalMode: string | undefined;
@@ -105,6 +106,7 @@ export interface CliArgs {
   rawOutput: boolean | undefined;
   acceptRawOutputRisk: boolean | undefined;
   isCommand: boolean | undefined;
+  port?: number; 
 }
 
 /**
@@ -259,7 +261,16 @@ export async function parseArguments(
   yargsInstance.command(extensionsCommand);
   yargsInstance.command(skillsCommand);
   yargsInstance.command(hooksCommand);
-
+yargsInstance.command(
+  'serve',
+  'Start in API server mode, exposing an OpenAI-compatible endpoint on localhost',
+  (yargs) =>
+    yargs.option('port', {
+      type: 'number',
+      description: 'Port for serve mode (default: 8888)',
+      default: 8888,
+    }),
+);
   yargsInstance
     .command('$0 [query..]', 'Launch Gemini CLI', (yargsInstance) =>
       yargsInstance
