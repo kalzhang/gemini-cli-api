@@ -161,7 +161,7 @@ export async function runServeCommand(
   const contentGenerator = config.getContentGenerator();
 
   const app = express();
-  app.use(express.json({ limit: '100mb' }));
+  app.use(express.json({ limit: '200mb' }));
 
   // ─── POST /v1/chat/completions ────────────────────────────────────────────
 

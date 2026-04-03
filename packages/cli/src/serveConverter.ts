@@ -11,11 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
+import { writeSync } from 'fs';
 import type {
   GenerateContentParameters,
   GenerateContentConfig,
   Content,
+  Part,
   SafetySetting,
 } from '@google/genai';
 import type { OpenAIMessage } from './serveCommand.js';
@@ -24,9 +25,12 @@ import type { OpenAIMessage } from './serveCommand.js';
 
 // Exported so serveCommand.ts can use it in OpenAIMessage and OpenAIRequest,
 // keeping the type definition in one place.
-export type OpenAIContent =
-  | string
-  | Array<{ type: string; text?: string; [key: string]: unknown }>;
+export type OpenAIContentPart =
+  | { type: 'text'; text: string; [key: string]: unknown }
+  | { type: 'image_url'; image_url: { url: string }; [key: string]: unknown }
+  | { type: string; [key: string]: unknown };
+
+export type OpenAIContent = string | OpenAIContentPart[];
 
 export interface ConvertConfig {
   safetySettings?: SafetySetting[];
@@ -38,21 +42,84 @@ export interface ConvertConfig {
 
 // ---------- Internal helpers ----------
 
-// Normalises SillyTavern's content field to a plain string.
-// SillyTavern can send content as a string or as an array of typed parts even
-// when multimodal support is not configured. Array content is flattened to
-// text parts only — non-text parts are dropped until multimodal is added.
-// This prevents [object Object] reaching the model if the type guard is ever
-// bypassed at the call site.
-function contentToString(content: OpenAIContent): string {
-  if (typeof content === 'string') return content;
-  return content
-    .filter(
-      (p): p is { type: 'text'; text: string } =>
-        p.type === 'text' && typeof p.text === 'string',
+// Parses a data URL into its mime type and raw base64 payload.
+// Returns null if the URL is not a valid base64 data URL.
+function parseDataUrl(url: string): { mimeType: string; data: string } | null {
+  const match = url.match(/^data:([^;]+);base64,(.+)$/s);
+  if (!match) return null;
+  return { mimeType: match[1], data: match[2] };
+}
+
+// Converts an OpenAI content field to a Gemini Part array.
+//
+// Text parts are passed through as-is (trimming is the caller's responsibility
+// so that system message accumulation and turn skipping logic can decide).
+//
+// image_url parts with base64 data URLs are converted to inlineData parts.
+// image_url parts with HTTP URLs are not supported and are skipped with a log
+// line — fetching arbitrary URLs at request time adds network dependency and
+// failure modes that are out of scope.
+//
+// All other part types are silently dropped (future multimodal types).
+function contentToParts(content: OpenAIContent): Part[] {
+  if (typeof content === 'string') {
+    return content ? [{ text: content }] : [];
+  }
+
+  const parts: Part[] = [];
+  for (const item of content) {
+    if (item.type === 'text') {
+      const textItem = item as { type: 'text'; text?: string };
+      if (typeof textItem.text === 'string' && textItem.text) {
+        parts.push({ text: textItem.text });
+      }
+    } else if (item.type === 'image_url') {
+      const imageItem = item as { type: 'image_url'; image_url?: { url?: string } };
+      const url = imageItem.image_url?.url;
+      if (!url) {
+        writeSync(2, '[serve] skipping image_url part with missing url\n');
+        continue;
+      }
+      if (!url.startsWith('data:')) {
+        writeSync(
+          2,
+          `[serve] skipping HTTP image URL (not supported): ${url.slice(0, 80)}\n`,
+        );
+        continue;
+      }
+      const parsed = parseDataUrl(url);
+      if (!parsed) {
+        writeSync(2, '[serve] skipping malformed base64 data URL\n');
+        continue;
+      }
+      parts.push({ inlineData: { mimeType: parsed.mimeType, data: parsed.data } });
+    }
+    // All other types are silently dropped.
+  }
+  return parts;
+}
+
+// Returns true if a parts array has any content worth sending to the model.
+// A text-only part whose text is blank after trimming does not count.
+// An inlineData part always counts regardless of size.
+function hasContent(parts: Part[]): boolean {
+  return parts.some((p) => {
+    if ('inlineData' in p && p.inlineData) return true;
+    if ('text' in p && typeof p.text === 'string' && p.text.trim()) return true;
+    return false;
+  });
+}
+
+// Trims whitespace from all text parts in place, then removes any text parts
+// that are blank after trimming. inlineData parts are left untouched.
+function trimTextParts(parts: Part[]): Part[] {
+  return parts
+    .map((p) =>
+      'text' in p && typeof p.text === 'string'
+        ? { text: p.text.trim() }
+        : p,
     )
-    .map((p) => p.text)
-    .join('');
+    .filter((p) => !('text' in p) || Boolean(p.text));
 }
 
 function toGeminiRole(role: 'user' | 'assistant'): 'user' | 'model' {
@@ -65,9 +132,7 @@ function toGeminiRole(role: 'user' | 'assistant'): 'user' | 'model' {
 // part validation; a single space is safe and invisible to the model.
 function normalizeTurns(turns: Content[]): Content[] {
   if (turns.length === 0) return turns;
-
   const normalized: Content[] = [];
-
   for (const turn of turns) {
     const prev = normalized[normalized.length - 1];
     if (prev && prev.role === turn.role) {
@@ -76,13 +141,11 @@ function normalizeTurns(turns: Content[]): Content[] {
     }
     normalized.push(turn);
   }
-
   // Gemini rejects conversations that open with a 'model' turn.
   // Shouldn't happen with SillyTavern but guard defensively.
   if (normalized[0]?.role === 'model') {
     normalized.unshift({ role: 'user', parts: [{ text: ' ' }] });
   }
-
   return normalized;
 }
 
@@ -97,25 +160,29 @@ export function convertMessages(
   const conversationTurns: Content[] = [];
 
   for (const msg of messages) {
-    const text = contentToString(msg.content);
-
     if (msg.role === 'system') {
-      // Trim to prevent whitespace accumulating between the multiple system
-      // blocks SillyTavern emits (persona, scenario, main prompt, etc.).
+      // System messages are text-only. Image parts inside a system message are
+      // dropped — systemInstruction is a text field in the Gemini API.
+      const parts = contentToParts(msg.content);
+      const text = parts
+        .filter((p): p is { text: string } => 'text' in p && typeof p.text === 'string')
+        .map((p) => p.text)
+        .join('');
       const trimmed = text.trim();
       if (trimmed) systemParts.push(trimmed);
       continue;
     }
 
-    // Skip turns with empty or whitespace-only content. An empty text part
-    // risks backend rejection. Structural placeholders are handled by
-    // normalizeTurns; we don't need genuinely empty content turns.
-    const trimmed = text.trim();
-    if (!trimmed) continue;
+    const parts = trimTextParts(contentToParts(msg.content));
+
+    // Skip turns with no meaningful content. Empty text parts risk backend
+    // rejection. Structural placeholders for alternation are handled by
+    // normalizeTurns — we don't manufacture empty turns here.
+    if (!hasContent(parts)) continue;
 
     conversationTurns.push({
       role: toGeminiRole(msg.role),
-      parts: [{ text: trimmed }],
+      parts,
     });
   }
 
@@ -142,12 +209,12 @@ export function convertMessages(
   // field names — a typo like maxOutputToken (missing 's') won't compile.
   // Conditional spread omits undefined fields without losing the type.
   const config: GenerateContentConfig = {
-    ...(systemInstruction !== undefined   && { systemInstruction }),
-    ...(overrides.safetySettings          && { safetySettings:  overrides.safetySettings }),
-    ...(overrides.temperature !== undefined && { temperature:     overrides.temperature }),
+    ...(systemInstruction !== undefined && { systemInstruction }),
+    ...(overrides.safetySettings && { safetySettings: overrides.safetySettings }),
+    ...(overrides.temperature !== undefined && { temperature: overrides.temperature }),
     ...(overrides.maxOutputTokens !== undefined && { maxOutputTokens: overrides.maxOutputTokens }),
-    ...(overrides.topP !== undefined      && { topP:            overrides.topP }),
-    ...(overrides.stopSequences           && { stopSequences:   overrides.stopSequences }),
+    ...(overrides.topP !== undefined && { topP: overrides.topP }),
+    ...(overrides.stopSequences && { stopSequences: overrides.stopSequences }),
   };
 
   return { model, contents, config };
