@@ -14,7 +14,7 @@
   },
   "scripts": {
     "build": "node ../../scripts/build_package.js",
-    "start": "node dist/index.js",
+    "start": "node --disable-warning=DEP0040 dist/index.js",
     "debug": "node --inspect-brk dist/index.js",
     "lint": "eslint . --ext .ts,.tsx",
     "format": "prettier --write .",

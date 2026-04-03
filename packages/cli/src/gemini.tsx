@@ -473,19 +473,44 @@ export async function main() {
     }
 
     if (argv._?.[0] === 'serve') {
-      try {
-        const selectedType = settings.merged.security.auth.selectedType;
-        if (selectedType) {
-          await config.refreshAuth(selectedType);
-        }
-        initializeOutputListenersAndFlush(); // ← add this
-        await runServeCommand(config, argv.port);
-      } catch (err) {
-        writeSync(2, `Serve mode error: ${err}\n`);  // use writeSync here too
-      }
-      await runExitCleanup();
-      return;
+  try {
+    const selectedType = settings.merged.security.auth.selectedType;
+    if (selectedType) {
+      await config.refreshAuth(selectedType);
     }
+
+    // Install a filtered output listener before initializeOutputListenersAndFlush
+    // so its listenerCount guard skips adding an unfiltered one. drainBacklogs()
+    // still fires inside initializeOutputListenersAndFlush, routed through this filter.
+    const SERVE_SUPPRESS = [
+      'Keychain initialization encountered an error',
+      'Using FileKeychain fallback',
+    ];
+    const matchesSuppressed = (chunk: unknown): boolean => {
+      const text = typeof chunk === 'string' ? chunk : Buffer.isBuffer(chunk) ? chunk.toString() : String(chunk);
+      return SERVE_SUPPRESS.some((s) => text.includes(s));
+    };
+
+    coreEvents.on(CoreEvent.Output, (payload: OutputPayload) => {
+      if (matchesSuppressed(payload.chunk)) return;
+      if (payload.isStderr) writeToStderr(payload.chunk, payload.encoding);
+      else writeToStdout(payload.chunk, payload.encoding);
+    });
+
+    coreEvents.on(CoreEvent.ConsoleLog, (payload: ConsoleLogPayload) => {
+      if (matchesSuppressed(payload.content)) return;
+      if (payload.type === 'error' || payload.type === 'warn') writeToStderr(payload.content);
+      else writeToStdout(payload.content);
+    });
+
+    initializeOutputListenersAndFlush();
+    await runServeCommand(config, argv.port);
+  } catch (err) {
+    writeSync(2, `Serve mode error: ${err}\n`);
+  }
+  await runExitCleanup();
+  return;
+}
 
     const wasRaw = process.stdin.isRaw;
     if (config.isInteractive() && !wasRaw && process.stdin.isTTY) {

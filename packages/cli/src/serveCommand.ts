@@ -23,7 +23,7 @@ import { convertMessages, type OpenAIContent } from './serveConverter.js';
 // Must match the default in packages/cli/src/config/config.ts .option('port')
 const DEFAULT_PORT = 8888;
 const DEFAULT_MODEL = 'gemini-3.1-pro-preview';
-const MAX_RETRIES = 3;
+const MAX_RETRIES = 5;
 const RETRYABLE_CODES = [429, 500, 503];
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -333,8 +333,8 @@ export async function runServeCommand(
 
   await new Promise<void>((resolve) => {
     app.listen(port, () => {
-      writeSync(2, `Serve mode active -> listening on http://localhost:${port}\n`);
-      writeSync(2, `Connect SillyTavern to: http://localhost:${port}/v1\n`);
+      writeSync(2, `Serve mode active\n`);
+      writeSync(2, `Listening on: http://127.0.0.1:${port}/v1\n`);
       resolve();
     });
   });
