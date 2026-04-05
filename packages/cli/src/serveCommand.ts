@@ -26,6 +26,28 @@ const DEFAULT_MODEL = 'gemini-3.1-pro-preview';
 const MAX_RETRIES = 5;
 const RETRYABLE_CODES = [429, 500, 503];
 
+// ─── Model ID parsing ─────────────────────────────────────────────────────────
+//
+// SillyTavern's effort selector does not map to any field in its OpenAI-compatible
+// request body, so thinking level is encoded directly in the model name instead.
+// The colon is the separator: 'gemini-2.5-pro:thinking-high'
+//   → baseModel = 'gemini-2.5-pro'   (sent to the Gemini API)
+//   → thinkingOverride = 'high'       (controls thinkingLevel / thinkingBudget)
+//
+// Valid suffixes: :thinking-minimum | :thinking-low | :thinking-medium |
+//                 :thinking-high    | :thinking-maximum
+//
+// The base model name (no suffix) uses the model's default dynamic thinking.
+// The override takes priority over any reasoning_effort field in the request.
+
+const THINKING_SUFFIX_RE = /^(.+):thinking-(minimum|low|medium|high|maximum)$/;
+
+function parseModelId(id: string): { baseModel: string; thinkingOverride: string | undefined } {
+  const match = id.match(THINKING_SUFFIX_RE);
+  if (match) return { baseModel: match[1], thinkingOverride: match[2] };
+  return { baseModel: id, thinkingOverride: undefined };
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface OpenAIMessage {
@@ -41,6 +63,10 @@ interface OpenAIRequest {
   max_tokens?: number;
   top_p?: number;
   stop?: string | string[];
+  // Standard OpenAI reasoning effort field: 'auto'|'minimum'|'low'|'medium'|'high'|'maximum'|'none'|'off'
+  reasoning_effort?: string;
+  // SillyTavern's own reasoning flag
+  reasoning?: { enabled?: boolean };
 }
 
 // ─── Safety settings ─────────────────────────────────────────────────────────
@@ -118,13 +144,18 @@ function isSafetyBlock(reason?: string): boolean {
   return reason === 'SAFETY' || reason === 'RECITATION';
 }
 
-function extractText(chunk: any): string {
-  return (
-    chunk.candidates?.[0]?.content?.parts
-      ?.filter((p: any) => p.text != null)
-      .map((p: any) => p.text)
-      .join('') ?? ''
-  );
+// Extracts text and thought text separately from a response chunk.
+// Parts with part.thought === true are reasoning output; all others are answer content.
+function extractParts(chunk: any): { text: string; thoughtText: string } {
+  const parts: any[] = chunk.candidates?.[0]?.content?.parts ?? [];
+  let text = '';
+  let thoughtText = '';
+  for (const p of parts) {
+    if (p.text == null) continue;
+    if (p.thought) thoughtText += p.text;
+    else text += p.text;
+  }
+  return { text, thoughtText };
 }
 
 // Attempts generateContentStream with retries on retryable errors.
@@ -174,34 +205,72 @@ export async function runServeCommand(
       max_tokens,
       top_p,
       stop,
+      reasoning_effort,
+      reasoning,
     } = req.body as OpenAIRequest;
 
+    // targetModel is echoed back to SillyTavern in responses unchanged.
+    // baseModel is the name sent to the Gemini API (suffix stripped).
+    // thinkingOverride comes from the model suffix and takes priority over
+    // reasoning_effort, which SillyTavern does not actually send.
     const targetModel = model ?? DEFAULT_MODEL;
+    const { baseModel, thinkingOverride } = parseModelId(targetModel);
     const responseId  = `chatcmpl-${crypto.randomUUID()}`;
     const created     = Math.floor(Date.now() / 1000);
 
-    log(`request  model=${targetModel} stream=${stream} messages=${messages.length}`);
+    // Reasoning is active when:
+    //   - the model name carries a :thinking-<level> suffix, OR
+    //   - SillyTavern's reasoning.enabled flag is set, OR
+    //   - reasoning_effort is present and not an explicit disable value.
+    const wantsReasoning =
+      thinkingOverride !== undefined ||
+      reasoning?.enabled === true ||
+      (reasoning_effort !== undefined &&
+        reasoning_effort !== 'none' &&
+        reasoning_effort !== 'off');
+
+    // Model suffix takes priority; fall back to reasoning_effort; then 'auto'.
+    const thinkingLevel = wantsReasoning
+      ? (thinkingOverride ?? reasoning_effort ?? 'auto')
+      : undefined;
+
+    log(
+      `request  model=${baseModel} stream=${stream} messages=${messages.length}` +
+      (wantsReasoning ? ` thinking=${thinkingLevel}` : ''),
+    );
 
     const stopSequences = stop
       ? Array.isArray(stop) ? stop : [stop]
       : undefined;
 
-    const request = convertMessages(messages, targetModel, {
+    const request = convertMessages(messages, baseModel, {
       safetySettings:  SAFETY_SETTINGS,
       temperature,
       maxOutputTokens: max_tokens,
       topP:            top_p,
       stopSequences,
+      thinkingLevel,
+      includeThoughts: wantsReasoning,
     });
 
-    const makeStreamChunk = (content: string, finishReason: string | null = null) => ({
+    // isReasoning=true emits { reasoning_content } delta instead of { content }.
+    // When finishReason is not null, delta is always {} regardless of isReasoning.
+    const makeStreamChunk = (
+      content: string,
+      finishReason: string | null = null,
+      isReasoning = false,
+    ) => ({
       id:      responseId,
       object:  'chat.completion.chunk',
       created,
       model:   targetModel,
       choices: [{
         index:         0,
-        delta:         finishReason !== null ? {} : { content },
+        delta:         finishReason !== null
+                         ? {}
+                         : isReasoning
+                           ? { reasoning_content: content }
+                           : { content },
         finish_reason: finishReason,
       }],
     });
@@ -244,7 +313,10 @@ export async function runServeCommand(
             return;
           }
 
-          const text = extractText(chunk);
+          const { text, thoughtText } = extractParts(chunk);
+          if (thoughtText) {
+            res.write(`data: ${JSON.stringify(makeStreamChunk(thoughtText, null, true))}\n\n`);
+          }
           if (text) {
             res.write(`data: ${JSON.stringify(makeStreamChunk(text))}\n\n`);
           }
@@ -275,6 +347,7 @@ export async function runServeCommand(
         );
 
         let fullText         = '';
+        let fullThoughtText  = '';
         let lastFinishReason: string | undefined;
 
         for await (const chunk of generator) {
@@ -290,7 +363,9 @@ export async function runServeCommand(
             return;
           }
 
-          fullText += extractText(chunk);
+          const { text, thoughtText } = extractParts(chunk);
+          fullText        += text;
+          fullThoughtText += thoughtText;
           if (finishReason) lastFinishReason = finishReason;
         }
 
@@ -302,7 +377,12 @@ export async function runServeCommand(
           model:   targetModel,
           choices: [{
             index:         0,
-            message:       { role: 'assistant', content: fullText },
+            message: {
+              role:    'assistant',
+              content: fullText,
+              // Only include reasoning_content when there is actual thought output.
+              ...(fullThoughtText && { reasoning_content: fullThoughtText }),
+            },
             finish_reason: mapFinishReason(lastFinishReason),
           }],
         });
@@ -315,26 +395,39 @@ export async function runServeCommand(
   });
 
   // ─── GET /v1/models ──────────────────────────────────────────────────────────
+  // Base model entries use the model's default dynamic thinking.
+  // Suffixed entries encode the thinking level directly in the model ID so
+  // SillyTavern users can control reasoning depth via the model selector.
 
   app.get('/v1/models', (_req: Request, res: Response) => {
+    const ts = 1677610602;
+    const makeEntry = (id: string) => ({ id, object: 'model', created: ts, owned_by: 'google' });
+    const withLevels = (base: string) => [
+      makeEntry(base),
+// Removed thinking levels from drop down menu. Add back in if necessary.
+//      makeEntry(`${base}:thinking-minimum`),
+//      makeEntry(`${base}:thinking-low`),
+//      makeEntry(`${base}:thinking-medium`),
+//      makeEntry(`${base}:thinking-high`),
+      makeEntry(`${base}:thinking-maximum`),
+    ];
     res.json({
       object: 'list',
       data: [
-        { id: 'gemini-2.5-flash',   object: 'model', created: 1677610602, owned_by: 'google' },
-        { id: 'gemini-2.5-pro', object: 'model', created: 1677610602, owned_by: 'google' },
-        { id: 'gemini-3-flash-preview', object: 'model', created: 1677610602, owned_by: 'google' },
-        { id: 'gemini-3.1-pro-preview', object: 'model', created: 1677610602, owned_by: 'google' },
+        ...withLevels('gemini-2.5-flash'),
+        ...withLevels('gemini-2.5-pro'),
+        ...withLevels('gemini-3-flash-preview'),
+        ...withLevels('gemini-3.1-pro-preview'),
       ],
     });
   });
-
 
   // ─── Start ────────────────────────────────────────────────────────────────
 
   await new Promise<void>((resolve) => {
     app.listen(port, () => {
       writeSync(2, `Serve mode active\n`);
-      writeSync(2, `Listening on: http://127.0.0.1:${port}/v1\n`);
+      writeSync(2, `Connect SillyTavern to: http://127.0.0.1:${port}/v1\n`);
       resolve();
     });
   });

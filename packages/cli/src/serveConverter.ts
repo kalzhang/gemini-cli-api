@@ -38,6 +38,12 @@ export interface ConvertConfig {
   maxOutputTokens?: number;
   topP?: number;
   stopSequences?: string[];
+  // Thinking level string as received from the client:
+  // 'auto' | 'minimum' | 'low' | 'medium' | 'high' | 'maximum'
+  // Mapped to thinkingLevel (Gemini 3) or thinkingBudget (Gemini 2.5) by buildThinkingConfig.
+  thinkingLevel?: string;
+  // When true, thought summaries are included in response parts (part.thought === true).
+  includeThoughts?: boolean;
 }
 
 // ---------- Internal helpers ----------
@@ -149,6 +155,85 @@ function normalizeTurns(turns: Content[]): Content[] {
   return normalized;
 }
 
+// Builds a thinkingConfig object for GenerateContentConfig.
+//
+// Gemini 3 models use thinkingLevel (string enum).
+// Gemini 2.5 models use thinkingBudget (integer token count).
+//
+// Model family is detected from the model string:
+//   /^gemini-3/i  → Gemini 3  (thinkingLevel)
+//   otherwise     → Gemini 2.5 (thinkingBudget)
+//
+// Flash detection (/flash/i) controls availability of 'minimal' (Gemini 3)
+// and token budget 0 / maximum budget (Gemini 2.5).
+//
+// Level mapping (Gemini 3):
+//   minimum → 'minimal' (Flash) | 'low' (Pro, no minimal support)
+//   low     → 'low'
+//   medium  → 'medium' (Flash) | 'high' (Pro, medium unsupported)
+//   high    → 'high'
+//   maximum → 'high'
+//   auto    → omitted (model uses default dynamic thinking)
+//
+// Budget mapping (Gemini 2.5):
+//   minimum →    0 (Flash, disables thinking) |  128 (Pro, cannot disable)
+//   low     → 1024
+//   medium  → 8192
+//   high    → 16384
+//   maximum → 24576 (Flash) | 32768 (Pro)
+//   auto    →   -1 (dynamic)
+//
+// Returns undefined when neither thinking control nor includeThoughts is needed,
+// so the caller can omit the field entirely.
+//
+// Uses GenerateContentConfig['thinkingConfig'] as the return type to avoid
+// importing ThinkingConfig separately, which may not be exported in all SDK
+// versions. The shape is validated at compile time through the config spread.
+function buildThinkingConfig(
+  model: string,
+  level: string | undefined,
+  includeThoughts: boolean,
+): GenerateContentConfig['thinkingConfig'] {
+  if (!level && !includeThoughts) return undefined;
+
+  const isGemini3 = /^gemini-3/i.test(model);
+  const isFlash   = /flash/i.test(model);
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const config: any = {};
+
+  if (includeThoughts) config.includeThoughts = true;
+
+  if (level && level !== 'auto') {
+    if (isGemini3) {
+      const levelMap: Record<string, string> = {
+        minimum: isFlash ? 'minimal' : 'low',   // Pro has no 'minimal'
+        low:     'low',
+        medium:  isFlash ? 'medium' : 'high',   // Pro has no 'medium'
+        high:    'high',
+        maximum: 'high',
+      };
+      config.thinkingLevel = levelMap[level] ?? 'high';
+    } else {
+      // Gemini 2.5 — token budgets
+      const budgetMap: Record<string, number> = {
+        minimum: isFlash ? 0 : 128,       // Pro cannot disable thinking (min 128)
+        low:     1024,
+        medium:  8192,
+        high:    16384,
+        maximum: isFlash ? 24576 : 32768,
+      };
+      config.thinkingBudget = budgetMap[level] ?? -1;
+    }
+  } else if (!isGemini3 && level === 'auto') {
+    // For Gemini 2.5, 'auto' means dynamic thinking (-1).
+    // For Gemini 3, omitting thinkingLevel already means dynamic, so no action needed.
+    config.thinkingBudget = -1;
+  }
+
+  return config as GenerateContentConfig['thinkingConfig'];
+}
+
 // ---------- Main export ----------
 
 export function convertMessages(
@@ -205,6 +290,12 @@ export function convertMessages(
       ? { role: 'system', parts: [{ text: systemParts.join('\n\n') }] }
       : undefined;
 
+  const thinkingConfig = buildThinkingConfig(
+    model,
+    overrides.thinkingLevel,
+    overrides.includeThoughts ?? false,
+  );
+
   // Build config as GenerateContentConfig directly so TypeScript enforces
   // field names — a typo like maxOutputToken (missing 's') won't compile.
   // Conditional spread omits undefined fields without losing the type.
@@ -215,6 +306,7 @@ export function convertMessages(
     ...(overrides.maxOutputTokens !== undefined && { maxOutputTokens: overrides.maxOutputTokens }),
     ...(overrides.topP !== undefined && { topP: overrides.topP }),
     ...(overrides.stopSequences && { stopSequences: overrides.stopSequences }),
+    ...(thinkingConfig !== undefined && { thinkingConfig }),
   };
 
   return { model, contents, config };
